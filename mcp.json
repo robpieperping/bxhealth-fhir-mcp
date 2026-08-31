@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bxhealth-fhir-mcp": {
+      "command": "node",
+      "args": ["/Users/robpieper/mywork/bxhealth-fhir-mcp/dist/index.js"]
+    }
+  }
+}
