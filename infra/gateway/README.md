@@ -113,33 +113,89 @@ headers.
 the pod, use the bundled JDK: write a small `Probe.java` to
 `/var/gateway/tmp` and run `/opt/jdk/bin/java Probe.java`.
 
-## Open items against this AIC realm
+## Test client
 
-Three things the realm does not currently provide, each verified
-against its `openid-configuration`:
+`BxHealthAIAgentClientID` mints tokens for testing. Note the auth
+method: this client is **`client_secret_post`**, not basic — basic
+returns `invalid_client - Invalid authentication method`, which reads
+like a wrong password but is not.
 
-**`mcp:invoke` is not in `scopes_supported`.** The realm advertises
+```bash
+ISS="https://openam-bxhealthaz.forgeblocks.com/am/oauth2/realms/root/realms/alpha"
+curl -sS -X POST "$ISS/access_token" \
+  -d 'grant_type=client_credentials&scope=mcp:invoke&client_id=BxHealthAIAgentClientID&client_secret=<secret>'
+```
+
+Requesting no scope returns the client's full grant:
+`mcp:invoke patient/*.read openid profile fhirUser`.
+
+## The one thing still blocking end-to-end
+
+`McpProtectionFilter` reads `resourceIdPointer` from the **token
+introspection response**, and AM's introspection response has no `aud`
+field at all. The error is exact:
+
+```
+WWW-Authenticate: Bearer error="invalid_token",
+  error_description="Access token does not contain an '/aud' claim."
+```
+
+The JWT itself does carry `aud`, but it is the client_id
+(`BxHealthAIAgentClientID`), not the gateway resource — AM's default.
+Verified that AM ignores `audience`, `resource` and `aud` request
+parameters, so the audience cannot be asked for at token time; it has
+to be set on the OAuth2 provider (audience configuration or an access
+token modification script).
+
+Two things must both be true before a real token passes:
+
+1. AM issues `aud` = `https://bxhealth-mcp-gw.ping-devops.com/mcp`.
+2. That audience is visible **in the introspection response**, not just
+   in the JWT. If AM will not expose it there, swap
+   `TokenIntrospectionAccessTokenResolver` for a JWKS-based
+   `StatelessAccessTokenResolver` so the filter reads the JWT's own
+   claims. That trades revocation checking for claim visibility.
+
+Everything downstream of that check is already proven — see below.
+
+## Verified end to end
+
+With `McpProtectionFilter` temporarily lifted (token still validated by
+AM introspection, scope still enforced), the whole chain works through
+the public URL:
+
+- `initialize` -> 200, session opened on the MCP server
+- `tools/list` -> all 19 tools
+- `fhir_search_patients` -> live patient data from SmileCDR
+
+So AM token validation, scope enforcement, MCP protocol validation, the
+reverse proxy hop, and the backend are all good. The audience binding is
+the only gap.
+
+`McpValidationFilter` also enforces the MCP spec properly: a
+post-initialize request without `MCP-Protocol-Version: 2025-06-18` is
+rejected `-32600 Invalid Request`. Include that header in any manual
+test after initialize.
+
+## Other open items against this AIC realm
+
+**`mcp:invoke` is not in the realm's `scopes_supported`** (it advertises
 only `address phone openid profile fr:idm:* am-introspect-all-tokens
-email`. `AGENT_FACING_SCOPE` is enforced by `rsFilter`, so until that
-scope exists on the OAuth2 provider and is granted to the calling
-client, a valid token is still rejected for insufficient scope. Change
-the env var if a different scope name is used.
-
-**Nothing sets `aud` to the gateway resource.** `McpProtectionFilter`
-matches `resourceIdPointer: "/aud"` against
-`https://bxhealth-mcp-gw.ping-devops.com/mcp`, but AM issues `aud` as
-the client_id by default, and this realm advertises no resource
-indicator (RFC 8707) support. The audience has to come from the OAuth2
-provider's audience configuration or a script. The alternative --
-repointing `resourceIdPointer` at some other claim -- is not
-equivalent: audience-restricting the token to this gateway is the point
-of the filter.
+email`), but tokens carry it anyway, so it is granted at client level.
+Not a blocker; just do not expect discovery to list it.
 
 **RFC 8693 token exchange is not advertised.** `grant_types_supported`
 has no `urn:ietf:params:oauth:grant-type:token-exchange`. Phase 5's
 `OAuth2TokenExchangeFilter` and the app's existing
 `exchangeDelegationToken` both depend on it, so it needs enabling on
 the OAuth2 provider before either works.
+
+**`resourceId` must be an absolute URI.** Passing a bare identifier
+fails the route at build time with a NullPointerException from
+`org.forgerock.openig.mcp.ResourceId` — and a route that fails to build
+just returns 404, which looks like a routing mistake rather than a
+config error. Check the pod log for "An error occurred while building
+the route" whenever `/mcp` unexpectedly 404s.
 
 **Issuer string carries an explicit port.** Discovery reports the
 issuer as `...forgeblocks.com:443/am/...` while the resolvable URL has
