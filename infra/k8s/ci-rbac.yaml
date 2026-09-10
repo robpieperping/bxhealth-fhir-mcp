@@ -1,0 +1,69 @@
+# CI deploy identity for bxhealth-fhir-mcp.
+#
+# Why this exists: the human kubeconfig for this cluster authenticates
+# through an interactive OIDC exec plugin (pingone-gte-oidc). Base64ing
+# that kubeconfig into a CI secret does NOT work -- the plugin needs a
+# browser. GitHub Actions therefore gets its own namespace-scoped
+# ServiceAccount with a static token instead, which is both functional
+# and a smaller blast radius than exporting a personal identity.
+#
+# Apply once, into the target namespace:
+#   kubectl apply -n ping-devops-robpieper -f infra/k8s/ci-rbac.yaml
+#
+# Then build the kubeconfig CI uses from the token in the Secret below;
+# see infra/k8s/README.md.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-deployer
+---
+# Kubernetes 1.24+ stopped auto-creating token Secrets for
+# ServiceAccounts. This asks for one explicitly, because CI needs a
+# long-lived credential rather than a projected token that expires.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-deployer-token
+  annotations:
+    kubernetes.io/service-account.name: github-deployer
+type: kubernetes.io/service-account-token
+---
+# Exactly what the deploy job does and nothing more: apply the manifest,
+# set the image, and watch the rollout. Deliberately no secrets access --
+# CI never needs to read bxhealth-fhir-mcp-secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-deployer
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: github-deployer
+subjects:
+  - kind: ServiceAccount
+    name: github-deployer
