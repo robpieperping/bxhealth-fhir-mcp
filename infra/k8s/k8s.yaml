@@ -91,9 +91,15 @@ spec:
               cpu: "1"
               memory: 512Mi
           securityContext:
-            # The image already runs as the node user (uid 1000); this
-            # makes the cluster enforce it rather than trust it.
+            # runAsUser is REQUIRED alongside runAsNonRoot, not optional.
+            # The kubelet verifies non-rootness from the numeric UID, and
+            # a Dockerfile USER given as a name is invisible to it:
+            # omitting this fails the pod with CreateContainerConfigError
+            # "image has non-numeric user (node), cannot verify user is
+            # non-root". 1000 is the node user the image already runs as,
+            # and infra/Dockerfile states it numerically to match.
             runAsNonRoot: true
+            runAsUser: 1000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]

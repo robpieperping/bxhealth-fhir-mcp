@@ -20,5 +20,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 EXPOSE 3000
-USER node
+# Numeric, not "node": Kubernetes verifies runAsNonRoot from the UID and
+# cannot resolve a user name inside the image.
+USER 1000:1000
 CMD ["node", "dist/index.js"]
