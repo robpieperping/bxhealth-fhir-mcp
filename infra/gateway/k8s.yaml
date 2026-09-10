@@ -1,0 +1,152 @@
+# PingGateway in front of bxhealth-fhir-mcp.
+#
+# The gateway is the PUBLIC MCP endpoint; the MCP server has no Ingress
+# and is reachable only in-cluster. Agents call
+# https://bxhealth-mcp-gw.ping-devops.com/mcp, never the backend.
+#
+# Config lives in a ConfigMap built from infra/gateway/config/ (see
+# infra/gateway/README.md). Secrets come from the ping-gateway-secrets
+# Secret as environment variables, resolved by SystemAndEnvSecretStore:
+# with "format": "PLAIN" a clientSecretId is uppercased and dots become
+# underscores, so introspect.client.secret -> INTROSPECT_CLIENT_SECRET.
+#
+# Deliberately NOT baked into the ConfigMap: any credential. The
+# vendor's own reference config ships base64'd client secrets inline;
+# that is a leak, not a pattern to copy.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ping-gateway
+  labels:
+    app: ping-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ping-gateway
+  template:
+    metadata:
+      labels:
+        app: ping-gateway
+    spec:
+      securityContext:
+        # 11111 is the forgerock user baked into the image, stated
+        # numerically so the kubelet can verify runAsNonRoot.
+        runAsNonRoot: true
+        runAsUser: 11111
+        fsGroup: 11111
+      containers:
+        - name: gateway
+          image: cjmuir710/pinggateway:2026.3.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: JAVA_OPTS
+              value: "-Xms256m -Xmx512m"
+            - name: GATEWAY_URL
+              value: "https://bxhealth-mcp-gw.ping-devops.com"
+            # Internal Service DNS, never the public hostname: a public
+            # backend target invites an ingress loop, which presents as
+            # the backend returning 401 with gateway metadata.
+            - name: MCP_SERVER_URL
+              value: "http://bxhealth-fhir-mcp"
+          envFrom:
+            # AUTHORIZATION_SERVER_URI, INTROSPECT_URL,
+            # INTROSPECT_CLIENT_ID, INTROSPECT_CLIENT_SECRET,
+            # AGENT_FACING_SCOPE. The issuer and introspection URLs are
+            # not secrets but live here so the issuer changes in one
+            # place. They are DIFFERENT values: the issuer is what the
+            # gateway advertises to clients in
+            # /.well-known/oauth-protected-resource, and the
+            # introspection endpoint is what it calls internally.
+            - secretRef:
+                name: ping-gateway-secrets
+          volumeMounts:
+            # The image needs a WRITABLE instance directory at
+            # /var/gateway (it unpacks and writes there at startup).
+            # Without this emptyDir the gateway fails to start; the
+            # ConfigMap mounts below sit inside it.
+            - name: gateway-instance
+              mountPath: /var/gateway
+            - name: gateway-config
+              mountPath: /var/gateway/config/admin.json
+              subPath: admin.json
+              readOnly: true
+            - name: gateway-config
+              mountPath: /var/gateway/config/routes/00-health.json
+              subPath: 00-health.json
+              readOnly: true
+            - name: gateway-config
+              mountPath: /var/gateway/config/routes/mcp-fhir.json
+              subPath: mcp-fhir.json
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /gw-health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /gw-health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: gateway-instance
+          emptyDir: {}
+        - name: gateway-config
+          configMap:
+            name: ping-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ping-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: ping-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ping-gateway
+  annotations:
+    # MCP's GET /mcp is an SSE stream. nginx buffers proxied responses by
+    # default, which holds events until the buffer fills and makes the
+    # stream look dead; the long timeouts stop it cutting an idle stream.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts:
+        - bxhealth-mcp-gw.ping-devops.com
+  rules:
+    - host: bxhealth-mcp-gw.ping-devops.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ping-gateway
+                port:
+                  number: 80

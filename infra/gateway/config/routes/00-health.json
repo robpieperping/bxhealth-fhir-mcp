@@ -1,0 +1,12 @@
+{
+  "name": "00-health",
+  "condition": "${find(request.uri.path, '^/gw-health$')}",
+  "handler": {
+    "type": "StaticResponseHandler",
+    "config": {
+      "status": 200,
+      "headers": { "Content-Type": [ "application/json" ] },
+      "entity": "{\"status\":\"ok\"}"
+    }
+  }
+}
