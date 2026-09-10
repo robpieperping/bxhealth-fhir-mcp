@@ -1,0 +1,112 @@
+# bxhealth-fhir-mcp on the Ping SE DevOps cluster.
+#
+# Namespace is NOT hardcoded: select it first with
+#   kubens ping-devops-robpieper
+# then
+#   kubectl apply -f infra/k8s/k8s.yaml
+#
+# Prerequisites (created once, imperatively; see infra/k8s/README.md):
+#   kubectl create secret generic bxhealth-fhir-mcp-secrets ...
+#
+# There is no imagePullSecret: the GHCR package is public, so the
+# cluster pulls anonymously. Making the package private again means
+# adding a docker-registry secret here and in the pod spec.
+#
+# There is deliberately NO Ingress here. This service is reachable only
+# from inside the cluster, at http://bxhealth-fhir-mcp, and only
+# PingGateway is meant to call it. An MCP server that is directly
+# reachable from the internet makes the whole gateway story theatre.
+# The public entrypoint arrives in Phase 4 as the gateway's own Ingress.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bxhealth-fhir-mcp
+  labels:
+    app: bxhealth-fhir-mcp
+spec:
+  # MCP sessions live in memory, keyed by Mcp-Session-Id (see src/http.ts).
+  # A second pod would answer follow-up requests for sessions it never saw,
+  # which surfaces as intermittent "Session not found" 404s. One replica
+  # until there is either a shared session store or sticky sessions, and
+  # Recreate so a rollout never briefly runs two.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bxhealth-fhir-mcp
+  template:
+    metadata:
+      labels:
+        app: bxhealth-fhir-mcp
+    spec:
+      containers:
+        - name: mcp
+          # Tracks latest so a rollout restart ships updates without a
+          # manifest edit; CI also pushes a git-sha tag for rollback and
+          # sets the deployment to that sha on every deploy.
+          image: ghcr.io/robpieperping/bxhealth-fhir-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: MCP_TRANSPORT
+              value: "http"
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: "production"
+          envFrom:
+            # PINGONE_ENV_ID, PINGONE_CLIENT_ID, PINGONE_CLIENT_SECRET,
+            # FHIR_BASE_URL. The FHIR base URL is not a secret, but it
+            # lives here so there is exactly one place to change it.
+            - secretRef:
+                name: bxhealth-fhir-mcp-secrets
+          # Both probes use /healthz, which never touches FHIR. /readyz
+          # DOES call the FHIR server and is the better-looking readiness
+          # probe, but wiring it here would pull the pod out of the
+          # Service whenever FHIR hiccups -- turning a clear tool-level
+          # error into an opaque 503 from the gateway. /readyz stays a
+          # diagnostic you curl by hand.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            # The image already runs as the node user (uid 1000); this
+            # makes the cluster enforce it rather than trust it.
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bxhealth-fhir-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: bxhealth-fhir-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
