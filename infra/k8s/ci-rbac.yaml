@@ -46,6 +46,16 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # bxhealth-mcp-demo (the app) also applies a PVC and an Ingress. This
+  # ServiceAccount is the shared CI identity for both repos, so its Role
+  # has to cover every object either manifest applies -- kubectl apply
+  # fails the whole deploy on the first forbidden resource.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
