@@ -23,18 +23,18 @@ This is the same issuer the FHIR server advertises in its SMART
 `oauth-uris`, which is what makes the on-behalf-of hop in Phase 5
 possible at all.
 
-The gateway authenticates to AM as the **agent** registered in the AIC
-console under Gateways and Agents (`BxHealthGatewayID`). Verified
-behaviour of that identity:
+Tokens are validated **statelessly**, by verifying the JWT signature
+against the realm's JWK set, not by calling `/introspect`. AM's
+introspection response carries no `aud` field at all, so
+`McpProtectionFilter` had nothing to read; the JWT itself does carry
+`aud`. See "Why stateless" below.
 
-| Operation | Result |
-| --- | --- |
-| `POST /introspect` with HTTP Basic | **works** — this is all the gateway needs |
-| `POST /access_token` `grant_type=client_credentials` | `unauthorized_client` — the agent is authenticated but not allowed to mint tokens |
-
-So the agent can validate tokens but cannot issue them. Anything that
-needs to *obtain* a token (a test client, the Phase 5 backend hop) needs
-a separate OAuth 2.0 client in the alpha realm.
+A consequence worth noting: the gateway no longer needs the AIC agent
+(`BxHealthGatewayID`) at all, and `ping-gateway-secrets` no longer
+holds any credential. The agent remains the right identity if this is
+ever switched back to introspection — it introspects successfully over
+HTTP Basic, though it is refused `client_credentials` with
+`unauthorized_client`, so it can validate tokens but never issue them.
 
 ## Deploy
 
@@ -43,9 +43,8 @@ NS=ping-devops-robpieper
 ISS="https://openam-bxhealthaz.forgeblocks.com/am/oauth2/realms/root/realms/alpha"
 kubectl create secret generic ping-gateway-secrets -n $NS \
   --from-literal=AUTHORIZATION_SERVER_URI="$ISS" \
-  --from-literal=INTROSPECT_URL="$ISS/introspect" \
-  --from-literal=INTROSPECT_CLIENT_ID="BxHealthGatewayID" \
-  --from-literal=INTROSPECT_CLIENT_SECRET="<agent password>" \
+  --from-literal=TOKEN_ISSUER="https://openam-bxhealthaz.forgeblocks.com:443/am/oauth2/realms/root/realms/alpha" \
+  --from-literal=JWK_SET_URI="$ISS/connect/jwk_uri" \
   --from-literal=AGENT_FACING_SCOPE="mcp:invoke"
 
 kubectl create configmap ping-gateway-config -n $NS \
@@ -129,39 +128,69 @@ curl -sS -X POST "$ISS/access_token" \
 Requesting no scope returns the client's full grant:
 `mcp:invoke patient/*.read openid profile fhirUser`.
 
+## Why stateless, and the three gotchas in configuring it
+
+`McpProtectionFilter` reads `resourceIdPointer` from whatever the
+access token resolver returns. With
+`TokenIntrospectionAccessTokenResolver` that is AM's introspection
+response, which carries **no `aud` field at all**, so the filter failed
+every token with `Access token does not contain an '/aud' claim.` The
+JWT does carry `aud`, so `StatelessAccessTokenResolver` — verifying the
+signature against the realm's JWK set — is what makes the claim
+visible.
+
+The trade is revocation: a stateless check cannot see that a token was
+revoked before it expires. Tokens here are short-lived (3600s), which
+is the usual mitigation.
+
+Three things to get right:
+
+1. **The property is `jwkUrl`, not `jwkSetUri`.** The 2026 reference
+   documentation for `StatelessAccessTokenResolver` shows `jwkSetUri`;
+   this build rejects it with
+   `/heap/0/config/secretsProvider/config/jwkUrl: Expecting a value`.
+2. **`issuer` must match the token's `iss` byte for byte, including the
+   port.** AM reports its issuer as
+   `...forgeblocks.com:443/am/...` while the browsable URL has no port.
+   That is why `TOKEN_ISSUER` is a separate variable from
+   `AUTHORIZATION_SERVER_URI` rather than reusing it.
+3. **`verificationSecretId` is ignored** when the secrets provider is
+   `JwkSetSecretStore` (the key is selected by the JWT's `kid`), but it
+   still has to be present and non-empty.
+
 ## The one thing still blocking end-to-end
 
-`McpProtectionFilter` reads `resourceIdPointer` from the **token
-introspection response**, and AM's introspection response has no `aud`
-field at all. The error is exact:
+The audience *value*. AM issues `aud` as the client_id
+(`BxHealthAIAgentClientID`), not the gateway resource, and it ignores
+`audience`, `resource` and `aud` request parameters — verified — so it
+cannot be asked for at token time. It has to be set on the OAuth2
+provider, via its audience configuration or an access token
+modification script, to:
 
 ```
-WWW-Authenticate: Bearer error="invalid_token",
-  error_description="Access token does not contain an '/aud' claim."
+https://bxhealth-mcp-gw.ping-devops.com/mcp
 ```
 
-The JWT itself does carry `aud`, but it is the client_id
-(`BxHealthAIAgentClientID`), not the gateway resource — AM's default.
-Verified that AM ignores `audience`, `resource` and `aud` request
-parameters, so the audience cannot be asked for at token time; it has
-to be set on the OAuth2 provider (audience configuration or an access
-token modification script).
-
-Two things must both be true before a real token passes:
-
-1. AM issues `aud` = `https://bxhealth-mcp-gw.ping-devops.com/mcp`.
-2. That audience is visible **in the introspection response**, not just
-   in the JWT. If AM will not expose it there, swap
-   `TokenIntrospectionAccessTokenResolver` for a JWKS-based
-   `StatelessAccessTokenResolver` so the filter reads the JWT's own
-   claims. That trades revocation checking for claim visibility.
+Until then a valid token is refused with `Access Token resource ID does
+not match the expected one.` Note this is a *different* and much more
+specific error than before the resolver change: signature, issuer and
+scope now all pass, and only the audience comparison fails.
 
 Everything downstream of that check is already proven — see below.
 
 ## Verified end to end
 
-With `McpProtectionFilter` temporarily lifted (token still validated by
-AM introspection, scope still enforced), the whole chain works through
+Three outcomes are cleanly distinguishable, which is how you can tell
+the resolver is doing real work:
+
+| Request | Response |
+| --- | --- |
+| no token | 401, bare `Bearer resource_metadata="…"` |
+| tampered signature | 401 `invalid_token`, generic description |
+| valid token, wrong `aud` | 401 `Access Token resource ID does not match the expected one.` |
+
+With `McpProtectionFilter` temporarily lifted (token still validated
+against AM, scope still enforced), the whole chain works through
 the public URL:
 
 - `initialize` -> 200, session opened on the MCP server

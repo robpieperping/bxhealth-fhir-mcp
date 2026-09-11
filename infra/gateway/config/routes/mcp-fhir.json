@@ -1,39 +1,29 @@
 {
   "name": "mcp-fhir",
   "condition": "${find(request.uri.path, '^/mcp')}",
-
   "properties": {
     "gatewayUrl": "&{env['GATEWAY_URL']}",
     "mcpServerUrl": "&{env['MCP_SERVER_URL']}",
-    "introspectUrl": "&{env['INTROSPECT_URL']}",
     "authorizationServerUri": "&{env['AUTHORIZATION_SERVER_URI']}",
+    "tokenIssuer": "&{env['TOKEN_ISSUER']}",
+    "jwkSetUri": "&{env['JWK_SET_URI']}",
     "agentFacingScope": "&{env['AGENT_FACING_SCOPE']}"
   },
-
   "baseURI": "&{mcpServerUrl}",
-
   "heap": [
     {
-      "name": "SecretsStore",
-      "type": "SystemAndEnvSecretStore",
-      "config": { "format": "PLAIN" }
-    },
-    {
-      "name": "IntrospectionProviderHandler",
-      "type": "Chain",
+      "name": "RsFilterTokenResolver",
+      "type": "StatelessAccessTokenResolver",
       "config": {
-        "filters": [
-          {
-            "name": "IntrospectionClientAuth",
-            "type": "ClientSecretBasicAuthenticationFilter",
-            "config": {
-              "clientId": "${env['INTROSPECT_CLIENT_ID']}",
-              "clientSecretId": "introspect.client.secret",
-              "secretsProvider": "SecretsStore"
-            }
+        "issuer": "&{tokenIssuer}",
+        "secretsProvider": {
+          "type": "JwkSetSecretStore",
+          "config": {
+            "jwkUrl": "&{jwkSetUri}"
           }
-        ],
-        "handler": "ClientHandler"
+        },
+        "verificationSecretId": "stateless.verification.key",
+        "skewAllowance": "10 seconds"
       }
     },
     {
@@ -41,18 +31,13 @@
       "type": "OAuth2ResourceServerFilter",
       "config": {
         "requireHttps": false,
-        "scopes": [ "&{agentFacingScope}" ],
-        "accessTokenResolver": {
-          "type": "TokenIntrospectionAccessTokenResolver",
-          "config": {
-            "endpoint": "&{introspectUrl}",
-            "providerHandler": "IntrospectionProviderHandler"
-          }
-        }
+        "scopes": [
+          "&{agentFacingScope}"
+        ],
+        "accessTokenResolver": "RsFilterTokenResolver"
       }
     }
   ],
-
   "handler": {
     "type": "Chain",
     "config": {
@@ -63,7 +48,9 @@
             "resourceId": "&{gatewayUrl}/mcp",
             "authorizationServerUri": "&{authorizationServerUri}",
             "resourceServerFilter": "rsFilter",
-            "supportedScopes": [ "&{agentFacingScope}" ],
+            "supportedScopes": [
+              "&{agentFacingScope}"
+            ],
             "resourceIdPointer": "/aud"
           }
         },
