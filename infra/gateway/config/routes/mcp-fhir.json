@@ -1,0 +1,72 @@
+{
+  "name": "mcp-fhir",
+  "condition": "${find(request.uri.path, '^/mcp')}",
+  "properties": {
+    "gatewayUrl": "&{env['GATEWAY_URL']}",
+    "mcpServerUrl": "&{env['MCP_SERVER_URL']}",
+    "authorizationServerUri": "&{env['AUTHORIZATION_SERVER_URI']}",
+    "tokenIssuer": "&{env['TOKEN_ISSUER']}",
+    "jwkSetUri": "&{env['JWK_SET_URI']}",
+    "agentFacingScope": "&{env['AGENT_FACING_SCOPE']}"
+  },
+  "baseURI": "&{mcpServerUrl}",
+  "heap": [
+    {
+      "name": "RsFilterTokenResolver",
+      "type": "StatelessAccessTokenResolver",
+      "config": {
+        "issuer": "&{tokenIssuer}",
+        "secretsProvider": {
+          "type": "JwkSetSecretStore",
+          "config": {
+            "jwkUrl": "&{jwkSetUri}"
+          }
+        },
+        "verificationSecretId": "stateless.verification.key",
+        "skewAllowance": "10 seconds"
+      }
+    },
+    {
+      "name": "rsFilter",
+      "type": "OAuth2ResourceServerFilter",
+      "config": {
+        "requireHttps": false,
+        "scopes": [
+          "&{agentFacingScope}"
+        ],
+        "accessTokenResolver": "RsFilterTokenResolver"
+      }
+    }
+  ],
+  "handler": {
+    "type": "Chain",
+    "config": {
+      "filters": [
+        {
+          "type": "McpProtectionFilter",
+          "config": {
+            "resourceId": "&{gatewayUrl}/mcp",
+            "authorizationServerUri": "&{authorizationServerUri}",
+            "resourceServerFilter": "rsFilter",
+            "supportedScopes": [
+              "&{agentFacingScope}"
+            ],
+            "resourceIdPointer": "/aud"
+          }
+        },
+        {
+          "type": "McpValidationFilter",
+          "config": {
+            "acceptedOrigins": ".*"
+          }
+        }
+      ],
+      "handler": {
+        "type": "ReverseProxyHandler",
+        "config": {
+          "soTimeout": "1 hour"
+        }
+      }
+    }
+  }
+}
